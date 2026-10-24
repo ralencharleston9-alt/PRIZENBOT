@@ -14,6 +14,9 @@ const {
   Events
 } = require("discord.js");
 
+const fs = require("node:fs");
+const path = require("node:path");
+
 // ========================================
 // PRIZEN BOT — discord.js v14
 // ========================================
@@ -46,11 +49,66 @@ const COLORS = {
   green: 0x57F287
 };
 
+const DATA_FILE = path.join(__dirname, "data.json");
+
+const defaultData = () => ({
+  giveaways: {},
+  warnings: {},
+  tickets: {},
+  raidModeGuilds: [],
+  locks: {}
+});
+
+let data = defaultData();
+let saveQueue = Promise.resolve();
+
+function loadData() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) {
+      data = defaultData();
+      return;
+    }
+
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+
+    data = {
+      ...defaultData(),
+      ...parsed,
+      giveaways: parsed.giveaways || {},
+      warnings: parsed.warnings || {},
+      tickets: parsed.tickets || {},
+      raidModeGuilds: parsed.raidModeGuilds || [],
+      locks: parsed.locks || {}
+    };
+  } catch (error) {
+    console.error("Could not load data.json:", error.message);
+    console.error(
+      "The existing file was not overwritten. Back it up and repair its JSON before restarting."
+    );
+    process.exit(1);
+  }
+}
+
+function saveData() {
+  // Serialize writes so simultaneous button clicks do not corrupt the file.
+  saveQueue = saveQueue.then(async () => {
+    const tempFile = `${DATA_FILE}.tmp`;
+    await fs.promises.writeFile(
+      tempFile,
+      JSON.stringify(data, null, 2),
+      "utf8"
+    );
+    await fs.promises.rename(tempFile, DATA_FILE);
+  });
+
+  return saveQueue;
+}
+
+loadData();
+
 const spamTracker = new Map();
 const joinTracker = new Map();
-const giveaways = new Map();
-const warnedUsers = new Map();
-const raidModeGuilds = new Set();
+const activeTimers = new Map();
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -62,17 +120,51 @@ function makeEmbed(title, description, color = COLORS.purple) {
     .setTimestamp();
 }
 
-function isStaff(interaction) {
+function isRaidMode(guildId) {
+  return data.raidModeGuilds.includes(guildId);
+}
+
+async function isStaff(interaction) {
   if (!interaction.inGuild()) return false;
 
-  const perms = interaction.memberPermissions;
+  const permissions = interaction.memberPermissions;
 
-  return Boolean(
-    perms?.has(PermissionFlagsBits.Administrator) ||
-    perms?.has(PermissionFlagsBits.ManageGuild) ||
-    (STAFF_ROLE_ID &&
-      interaction.member?.roles?.cache?.has(STAFF_ROLE_ID))
-  );
+  if (
+    permissions?.has(PermissionFlagsBits.Administrator) ||
+    permissions?.has(PermissionFlagsBits.ManageGuild)
+  ) {
+    return true;
+  }
+
+  if (!STAFF_ROLE_ID) return false;
+
+  try {
+    const member = await interaction.guild.members.fetch(
+      interaction.user.id
+    );
+    return member.roles.cache.has(STAFF_ROLE_ID);
+  } catch {
+    return false;
+  }
+}
+
+async function requireStaff(interaction) {
+  if (await isStaff(interaction)) return true;
+
+  const reply = {
+    content: "You need the required staff permissions to use this command.",
+    ephemeral: true
+  };
+
+  if (interaction.deferred) {
+    await interaction.editReply(reply);
+  } else if (interaction.replied) {
+    await interaction.followUp(reply);
+  } else {
+    await interaction.reply(reply);
+  }
+
+  return false;
 }
 
 async function getTextChannel(guild, name) {
@@ -99,21 +191,30 @@ async function logToGuild(guild, message) {
         c.type === ChannelType.GuildText
     );
 
-    if (channel) await channel.send(message);
+    if (channel) await channel.send({ content: message });
   } catch (error) {
     console.error("Could not send security log:", error.message);
   }
 }
 
-async function requireStaff(interaction) {
-  if (isStaff(interaction)) return true;
+async function safeReply(interaction, content) {
+  const payload = {
+    content,
+    ephemeral: true,
+    allowedMentions: { parse: [] }
+  };
 
-  await interaction.reply({
-    content: "You need the required staff permissions to use this command.",
-    ephemeral: true
-  });
-
-  return false;
+  try {
+    if (interaction.deferred) {
+      await interaction.editReply(payload);
+    } else if (interaction.replied) {
+      await interaction.followUp(payload);
+    } else {
+      await interaction.reply(payload);
+    }
+  } catch (error) {
+    console.error("Could not reply to interaction:", error.message);
+  }
 }
 
 // ========================================
@@ -130,55 +231,41 @@ const commands = [
     .setName("warn")
     .setDescription("Warn a member")
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
-    .addUserOption(option =>
-      option.setName("member")
-        .setDescription("Member to warn")
-        .setRequired(true))
-    .addStringOption(option =>
-      option.setName("reason")
-        .setDescription("Reason for the warning")
-        .setRequired(true)
-        .setMaxLength(500)),
+    .addUserOption(o =>
+      o.setName("member").setDescription("Member to warn").setRequired(true))
+    .addStringOption(o =>
+      o.setName("reason").setDescription("Warning reason")
+        .setRequired(true).setMaxLength(500)),
 
   new SlashCommandBuilder()
     .setName("timeout")
     .setDescription("Temporarily timeout a member")
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
-    .addUserOption(option =>
-      option.setName("member")
-        .setDescription("Member to timeout")
-        .setRequired(true))
-    .addIntegerOption(option =>
-      option.setName("minutes")
-        .setDescription("Timeout length in minutes, maximum 40320")
-        .setRequired(true)
-        .setMinValue(1)
-        .setMaxValue(40320))
-    .addStringOption(option =>
-      option.setName("reason")
-        .setDescription("Reason for timeout")
-        .setRequired(false)
-        .setMaxLength(500)),
+    .addUserOption(o =>
+      o.setName("member").setDescription("Member to timeout").setRequired(true))
+    .addIntegerOption(o =>
+      o.setName("minutes").setDescription("Duration, maximum 40320 minutes")
+        .setRequired(true).setMinValue(1).setMaxValue(40320))
+    .addStringOption(o =>
+      o.setName("reason").setDescription("Reason")
+        .setRequired(false).setMaxLength(500)),
 
   new SlashCommandBuilder()
     .setName("purge")
     .setDescription("Delete recent messages")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
-    .addIntegerOption(option =>
-      option.setName("amount")
-        .setDescription("Number of messages to delete, from 1 to 100")
-        .setRequired(true)
-        .setMinValue(1)
-        .setMaxValue(100)),
+    .addIntegerOption(o =>
+      o.setName("amount").setDescription("Number of messages, 1–100")
+        .setRequired(true).setMinValue(1).setMaxValue(100)),
 
   new SlashCommandBuilder()
     .setName("lock")
-    .setDescription("Prevent members from sending messages in this channel")
+    .setDescription("Prevent members from sending messages")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
 
   new SlashCommandBuilder()
     .setName("unlock")
-    .setDescription("Allow members to send messages in this channel")
+    .setDescription("Remove the channel message restriction")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
 
   new SlashCommandBuilder()
@@ -190,17 +277,12 @@ const commands = [
     .setName("giveaway")
     .setDescription("Start a button-entry giveaway")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addStringOption(option =>
-      option.setName("prize")
-        .setDescription("What the winner receives")
-        .setRequired(true)
-        .setMaxLength(200))
-    .addIntegerOption(option =>
-      option.setName("minutes")
-        .setDescription("Duration in minutes")
-        .setRequired(true)
-        .setMinValue(1)
-        .setMaxValue(10080)),
+    .addStringOption(o =>
+      o.setName("prize").setDescription("Prize being offered")
+        .setRequired(true).setMaxLength(200))
+    .addIntegerOption(o =>
+      o.setName("minutes").setDescription("Duration in minutes")
+        .setRequired(true).setMinValue(1).setMaxValue(10080)),
 
   new SlashCommandBuilder()
     .setName("ticket-panel")
@@ -214,7 +296,7 @@ const commands = [
 ].map(command => command.toJSON());
 
 // ========================================
-// REGISTER COMMANDS
+// COMMAND REGISTRATION
 // ========================================
 
 async function registerCommands() {
@@ -229,6 +311,207 @@ async function registerCommands() {
 }
 
 // ========================================
+// GIVEAWAYS — PERSISTENT STORAGE
+// ========================================
+
+function giveawayRow(id, ended = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(ended ? `prizen_ended:${id}` : `prizen_enter:${id}`)
+      .setLabel(ended ? "Giveaway Ended" : "Enter Giveaway")
+      .setStyle(ended ? ButtonStyle.Secondary : ButtonStyle.Primary)
+      .setEmoji(ended ? "🔒" : "🎉")
+      .setDisabled(ended)
+  );
+}
+
+function giveawayEmbed(giveaway, ended = false) {
+  const entries = Object.keys(giveaway.entries || {}).length;
+
+  if (ended) {
+    return makeEmbed(
+      "🎉 PRIZEN GIVEAWAY ENDED",
+      `**Prize:** ${giveaway.prize}\n` +
+      `**Hosted by:** <@${giveaway.hostId}>\n` +
+      `**Entries:** ${entries}\n` +
+      (giveaway.winnerId
+        ? `**Winner:** <@${giveaway.winnerId}>`
+        : "No eligible entries, so there is no winner."),
+      COLORS.green
+    );
+  }
+
+  return makeEmbed(
+    "🎉 PRIZEN GIVEAWAY",
+    `**Prize:** ${giveaway.prize}\n` +
+    `**Hosted by:** <@${giveaway.hostId}>\n` +
+    `**Entries:** ${entries}\n` +
+    `**Ends:** <t:${Math.floor(giveaway.endAt / 1000)}:R>`,
+    COLORS.purple
+  );
+}
+
+async function finishGiveaway(id) {
+  const giveaway = data.giveaways[id];
+  if (!giveaway || giveaway.resultPosted) return;
+
+  // Pick and save the winner once. Restarts won't reroll the result.
+  if (!giveaway.ended) {
+    giveaway.ended = true;
+    const entries = Object.keys(giveaway.entries || {});
+
+    giveaway.winnerId = entries.length
+      ? entries[Math.floor(Math.random() * entries.length)]
+      : null;
+
+    giveaway.endedAt = Date.now();
+    await saveData();
+  }
+
+  const guild = client.guilds.cache.get(giveaway.guildId);
+
+  if (!guild) {
+    console.error(`Giveaway ${id}: guild unavailable; result remains saved.`);
+    return;
+  }
+
+  try {
+    const channel = await guild.channels.fetch(giveaway.channelId);
+    if (!channel || !channel.isTextBased()) {
+      throw new Error("Giveaway channel is missing or is not text-based.");
+    }
+
+    let message = null;
+
+    try {
+      message = await channel.messages.fetch(giveaway.messageId);
+    } catch {
+      console.warn(`Giveaway ${id}: original message could not be fetched.`);
+    }
+
+    if (message) {
+      await message.edit({
+        embeds: [giveawayEmbed(giveaway, true)],
+        components: [giveawayRow(id, true)]
+      });
+    }
+
+    // Persist before announcing so a restart cannot choose a new winner.
+    giveaway.resultPosted = true;
+    await saveData();
+
+    if (giveaway.winnerId) {
+      await channel.send({
+        content:
+          `🎉 Congratulations <@${giveaway.winnerId}>! ` +
+          `You won **${giveaway.prize}**. Contact PRIZEN staff to claim it.`,
+        allowedMentions: { users: [giveaway.winnerId] }
+      });
+
+      try {
+        const winner = await client.users.fetch(giveaway.winnerId);
+        await winner.send({
+          embeds: [
+            makeEmbed(
+              "You won a PRIZEN giveaway!",
+              `You won **${giveaway.prize}** in **${guild.name}**.\n` +
+              "Contact the server's staff to arrange your prize."
+            )
+          ]
+        });
+      } catch {
+        await logToGuild(
+          guild,
+          `⚠️ Could not DM giveaway winner <@${giveaway.winnerId}>. ` +
+          "Please contact them in the server."
+        );
+      }
+    } else {
+      await channel.send(
+        `The PRIZEN giveaway for **${giveaway.prize}** ended without any entries.`
+      );
+    }
+
+    await logToGuild(
+      guild,
+      `🎉 Giveaway ended: **${giveaway.prize}**. ` +
+      `Entries: ${Object.keys(giveaway.entries || {}).length}. ` +
+      `Winner: ${giveaway.winnerId ? `<@${giveaway.winnerId}>` : "None"}.`
+    );
+  } catch (error) {
+    console.error(`Could not finish giveaway ${id}:`, error);
+  }
+}
+
+function scheduleGiveaway(id) {
+  if (activeTimers.has(id)) {
+    clearTimeout(activeTimers.get(id));
+    activeTimers.delete(id);
+  }
+
+  const giveaway = data.giveaways[id];
+  if (!giveaway || giveaway.resultPosted) return;
+
+  const delay = Math.max(0, giveaway.endAt - Date.now());
+
+  const timer = setTimeout(async () => {
+    activeTimers.delete(id);
+    await finishGiveaway(id);
+  }, Math.min(delay, 2_147_000_000));
+
+  activeTimers.set(id, timer);
+}
+
+// ========================================
+// TICKETS
+// ========================================
+
+function ticketCloseRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("prizen_ticket_close")
+      .setLabel("Close Ticket")
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+async function closeTicket(interaction, channel) {
+  const ownerId = data.tickets[channel.id]?.ownerId ||
+    channel.topic?.match(/PRIZEN_OWNER:(\d+)/)?.[1] ||
+    channel.name.match(/^ticket-(\d+)$/)?.[1];
+
+  const owner = ownerId === interaction.user.id;
+  const staff = await isStaff(interaction);
+
+  if (!owner && !staff) {
+    return safeReply(
+      interaction,
+      "Only this ticket's owner or authorized staff can close it."
+    );
+  }
+
+  await interaction.reply({
+    content: "This ticket will close in 3 seconds.",
+    ephemeral: true
+  });
+
+  await wait(3000);
+
+  try {
+    data.tickets[channel.id] = {
+      ...(data.tickets[channel.id] || {}),
+      ownerId: ownerId || null,
+      closedAt: Date.now()
+    };
+    await saveData();
+
+    await channel.delete("PRIZEN support ticket closed");
+  } catch (error) {
+    console.error("Ticket close failed:", error.message);
+  }
+}
+
+// ========================================
 // STARTUP
 // ========================================
 
@@ -240,6 +523,11 @@ client.once(Events.ClientReady, async readyClient => {
   } catch (error) {
     console.error("Slash command registration failed:", error);
   }
+
+  // Restore unfinished giveaways after restarts.
+  for (const [id, giveaway] of Object.entries(data.giveaways)) {
+    if (!giveaway.resultPosted) scheduleGiveaway(id);
+  }
 });
 
 client.on(Events.Error, error => {
@@ -247,7 +535,7 @@ client.on(Events.Error, error => {
 });
 
 // ========================================
-// SERVER SETUP
+// SLASH COMMAND INTERACTIONS
 // ========================================
 
 client.on(Events.InteractionCreate, async interaction => {
@@ -256,12 +544,10 @@ client.on(Events.InteractionCreate, async interaction => {
       const { commandName, guild, channel } = interaction;
 
       if (!guild) {
-        return interaction.reply({
-          content: "Use this command inside the PRIZEN server.",
-          ephemeral: true
-        });
+        return safeReply(interaction, "Use this command inside the PRIZEN server.");
       }
 
+      // SETUP
       if (commandName === "setup") {
         if (!await requireStaff(interaction)) return;
 
@@ -269,8 +555,8 @@ client.on(Events.InteractionCreate, async interaction => {
 
         const welcome = await getTextChannel(guild, "welcome");
         const logs = await getTextChannel(guild, "security-logs");
-        await getTextChannel(guild, "general");
-        await getTextChannel(guild, "support");
+        const general = await getTextChannel(guild, "general");
+        const support = await getTextChannel(guild, "support");
 
         await logs.send({
           embeds: [
@@ -283,27 +569,43 @@ client.on(Events.InteractionCreate, async interaction => {
         });
 
         await interaction.editReply(
-          `Setup complete. Created or found: ${welcome}, ${logs}, #general, and #support.`
+          `Setup complete. Found or created: ${welcome}, ${logs}, ${general}, ${support}.`
         );
         return;
       }
 
-      // All remaining commands require staff authorization.
+      // All commands except ticket-close require staff.
       if (commandName !== "ticket-close" &&
           !await requireStaff(interaction)) return;
 
+      // WARN
       if (commandName === "warn") {
         const user = interaction.options.getUser("member");
         const reason = interaction.options.getString("reason");
-        const key = `${guild.id}:${user.id}`;
+        const member = await guild.members.fetch(user.id).catch(() => null);
 
-        const warnings = warnedUsers.get(key) || [];
-        warnings.push({
+        if (!member) {
+          return safeReply(interaction, "That member is not in this server.");
+        }
+
+        if (user.id === interaction.user.id || user.bot) {
+          return safeReply(interaction, "You cannot warn yourself or a bot.");
+        }
+
+        if (member.permissions.has(PermissionFlagsBits.Administrator)) {
+          return safeReply(interaction, "This command cannot warn an administrator.");
+        }
+
+        const key = `${guild.id}:${user.id}`;
+        data.warnings[key] ||= [];
+
+        data.warnings[key].push({
           reason,
           moderator: interaction.user.id,
           at: Date.now()
         });
-        warnedUsers.set(key, warnings);
+
+        await saveData();
 
         try {
           await user.send({
@@ -319,70 +621,86 @@ client.on(Events.InteractionCreate, async interaction => {
 
         await logToGuild(
           guild,
-          `⚠️ **Warning:** ${user.tag} (${user.id})\nModerator: ${interaction.user.tag}\nReason: ${reason}`
+          `⚠️ **Warning:** ${user.tag} (${user.id})\n` +
+          `Moderator: ${interaction.user.tag}\nReason: ${reason}\n` +
+          `Total recorded: ${data.warnings[key].length}`
         );
 
-        await interaction.reply({
-          content: `Warned ${user.tag}. Total warnings this session: ${warnings.length}.`,
-          ephemeral: true
-        });
+        await safeReply(
+          interaction,
+          `Warned ${user.tag}. Total recorded warnings: ${data.warnings[key].length}.`
+        );
         return;
       }
 
+      // TIMEOUT
       if (commandName === "timeout") {
         const user = interaction.options.getUser("member");
         const minutes = interaction.options.getInteger("minutes");
         const reason = interaction.options.getString("reason") ||
           "No reason supplied";
 
-        const member = await guild.members.fetch(user.id);
+        const member = await guild.members.fetch(user.id).catch(() => null);
+
+        if (!member) {
+          return safeReply(interaction, "That member is not in this server.");
+        }
+
+        if (
+          user.id === interaction.user.id ||
+          user.id === client.user.id ||
+          member.permissions.has(PermissionFlagsBits.Administrator)
+        ) {
+          return safeReply(interaction, "You cannot timeout yourself, the bot, or an administrator.");
+        }
 
         if (!member.moderatable) {
-          return interaction.reply({
-            content: "I cannot timeout that member. Check my role position and permissions.",
-            ephemeral: true
-          });
+          return safeReply(
+            interaction,
+            "I cannot timeout that member. Check my Moderate Members permission and role position."
+          );
         }
 
         await member.timeout(minutes * 60 * 1000, reason);
 
         await logToGuild(
           guild,
-          `⏱️ **Timeout:** ${user.tag}\nDuration: ${minutes} minutes\nModerator: ${interaction.user.tag}\nReason: ${reason}`
+          `⏱️ **Timeout:** ${user.tag}\nDuration: ${minutes} minutes\n` +
+          `Moderator: ${interaction.user.tag}\nReason: ${reason}`
         );
 
-        await interaction.reply({
-          content: `Timed out ${user.tag} for ${minutes} minute(s).`,
-          ephemeral: true
-        });
+        await safeReply(interaction, `Timed out ${user.tag} for ${minutes} minute(s).`);
         return;
       }
 
+      // PURGE
       if (commandName === "purge") {
-        if (!channel || !channel.isTextBased() ||
-            !channel.messages || !channel.bulkDelete) {
-          return interaction.reply({
-            content: "This command requires a text channel.",
-            ephemeral: true
-          });
+        if (!channel || channel.type !== ChannelType.GuildText) {
+          return safeReply(interaction, "This command requires a server text channel.");
         }
 
         const amount = interaction.options.getInteger("amount");
-        const deleted = await channel.bulkDelete(amount, true);
 
-        await interaction.reply({
-          content: `Deleted ${deleted.size} recent message(s). Messages older than 14 days cannot be bulk-deleted.`,
-          ephemeral: true
-        });
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+          const deleted = await channel.bulkDelete(amount, true);
+          await interaction.editReply(
+            `Deleted ${deleted.size} recent message(s). Messages older than 14 days cannot be bulk-deleted.`
+          );
+        } catch (error) {
+          console.error("Purge failed:", error);
+          await interaction.editReply(
+            "I could not delete those messages. Check my Manage Messages permission."
+          );
+        }
         return;
       }
 
+      // LOCK / UNLOCK
       if (commandName === "lock" || commandName === "unlock") {
-        if (!channel || !channel.isTextBased()) {
-          return interaction.reply({
-            content: "Use this command in a text channel.",
-            ephemeral: true
-          });
+        if (!channel || !channel.isTextBased() || !channel.permissionOverwrites) {
+          return safeReply(interaction, "Use this command in a server text channel.");
         }
 
         const shouldLock = commandName === "lock";
@@ -391,6 +709,19 @@ client.on(Events.InteractionCreate, async interaction => {
           guild.roles.everyone,
           { SendMessages: shouldLock ? false : null }
         );
+
+        if (shouldLock) {
+          data.locks[channel.id] = {
+            guildId: guild.id,
+            channelId: channel.id,
+            lockedAt: Date.now(),
+            moderatorId: interaction.user.id
+          };
+        } else {
+          delete data.locks[channel.id];
+        }
+
+        await saveData();
 
         await interaction.reply(
           shouldLock
@@ -405,20 +736,22 @@ client.on(Events.InteractionCreate, async interaction => {
         return;
       }
 
+      // RAID MODE
       if (commandName === "raidmode") {
-        const wasEnabled = raidModeGuilds.has(guild.id);
+        const enabled = !isRaidMode(guild.id);
 
-        if (wasEnabled) raidModeGuilds.delete(guild.id);
-        else raidModeGuilds.add(guild.id);
+        data.raidModeGuilds = enabled
+          ? [...new Set([...data.raidModeGuilds, guild.id])]
+          : data.raidModeGuilds.filter(id => id !== guild.id);
 
-        const enabled = !wasEnabled;
+        await saveData();
 
-        await interaction.reply({
-          content: enabled
+        await safeReply(
+          interaction,
+          enabled
             ? "🛡️ Raid mode enabled. New-member joins will be monitored more strictly."
-            : "Raid mode disabled. Standard monitoring remains active.",
-          ephemeral: true
-        });
+            : "Raid mode disabled. Standard monitoring remains active."
+        );
 
         await logToGuild(
           guild,
@@ -427,98 +760,47 @@ client.on(Events.InteractionCreate, async interaction => {
         return;
       }
 
+      // GIVEAWAY
       if (commandName === "giveaway") {
         const prize = interaction.options.getString("prize");
         const minutes = interaction.options.getInteger("minutes");
-        const endAt = Date.now() + minutes * 60 * 1000;
-        const giveawayId = `${guild.id}-${Date.now()}`;
+        const id = `${guild.id}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`prizen_enter:${giveawayId}`)
-            .setLabel("Enter Giveaway")
-            .setStyle(ButtonStyle.Primary)
-            .setEmoji("🎉")
-        );
-
-        const embed = makeEmbed(
-          "🎉 PRIZEN GIVEAWAY",
-          `**Prize:** ${prize}\n**Hosted by:** ${interaction.user}\n**Entries:** 0\n**Ends:** <t:${Math.floor(endAt / 1000)}:R>`,
-          COLORS.purple
-        );
-
-        await interaction.reply({
-          embeds: [embed],
-          components: [row]
-        });
-
-        const message = await interaction.fetchReply();
-
-        giveaways.set(giveawayId, {
+        const giveaway = {
           guildId: guild.id,
           channelId: channel.id,
-          messageId: message.id,
+          messageId: null,
+          hostId: interaction.user.id,
           prize,
-          endAt,
-          entries: new Set()
+          endAt: Date.now() + minutes * 60_000,
+          entries: {},
+          ended: false,
+          winnerId: null,
+          resultPosted: false
+        };
+
+        await interaction.deferReply();
+
+        const message = await interaction.editReply({
+          embeds: [giveawayEmbed(giveaway)],
+          components: [giveawayRow(id)],
+          fetchReply: true,
+          allowedMentions: { parse: [] }
         });
 
-        setTimeout(async () => {
-          const giveaway = giveaways.get(giveawayId);
-          if (!giveaway) return;
+        giveaway.messageId = message.id;
+        data.giveaways[id] = giveaway;
+        await saveData();
+        scheduleGiveaway(id);
 
-          try {
-            const giveawayChannel = await guild.channels.fetch(
-              giveaway.channelId
-            );
-            const giveawayMessage = await giveawayChannel.messages.fetch(
-              giveaway.messageId
-            );
-
-            const entrants = [...giveaway.entries];
-            const winnerId = entrants.length
-              ? entrants[Math.floor(Math.random() * entrants.length)]
-              : null;
-
-            const endedEmbed = makeEmbed(
-              "🎉 GIVEAWAY ENDED",
-              `**Prize:** ${giveaway.prize}\n` +
-              `**Entries:** ${entrants.length}\n` +
-              (winnerId
-                ? `**Winner:** <@${winnerId}>`
-                : "No one entered, so there is no winner."),
-              COLORS.green
-            );
-
-            const disabledRow = new ActionRowBuilder().addComponents(
-              new ButtonBuilder()
-                .setCustomId(`prizen_ended:${giveawayId}`)
-                .setLabel("Giveaway Ended")
-                .setStyle(ButtonStyle.Secondary)
-                .setDisabled(true)
-            );
-
-            await giveawayMessage.edit({
-              embeds: [endedEmbed],
-              components: [disabledRow]
-            });
-
-            if (winnerId) {
-              await giveawayChannel.send(
-                `🎉 Congratulations <@${winnerId}>! You won **${giveaway.prize}**. Contact the PRIZEN staff to claim it.`
-              );
-            }
-
-            giveaways.delete(giveawayId);
-          } catch (error) {
-            console.error("Giveaway finish error:", error);
-            giveaways.delete(giveawayId);
-          }
-        }, minutes * 60 * 1000);
-
+        await logToGuild(
+          guild,
+          `🎉 Giveaway started by ${interaction.user.tag}: **${prize}**.`
+        );
         return;
       }
 
+      // TICKET PANEL
       if (commandName === "ticket-panel") {
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
@@ -531,7 +813,7 @@ client.on(Events.InteractionCreate, async interaction => {
           embeds: [
             makeEmbed(
               "PRIZEN Support",
-              "Need help? Open a private support ticket below. Please explain your issue clearly."
+              "Need help? Open a private support ticket below. Explain your issue clearly and a staff member will respond when available."
             )
           ],
           components: [row]
@@ -539,82 +821,67 @@ client.on(Events.InteractionCreate, async interaction => {
         return;
       }
 
+      // TICKET CLOSE COMMAND
       if (commandName === "ticket-close") {
-        if (!channel.name.startsWith("ticket-")) {
-          return interaction.reply({
-            content: "This command can only be used inside a ticket channel.",
-            ephemeral: true
-          });
+        if (!channel || channel.type !== ChannelType.GuildText ||
+            !channel.name.startsWith("ticket-")) {
+          return safeReply(interaction, "This command can only be used inside a ticket channel.");
         }
 
-        await interaction.reply("This ticket will close in 3 seconds.");
-        await wait(3000);
-        await channel.delete("PRIZEN ticket closed by staff");
-        return;
+        return closeTicket(interaction, channel);
       }
     }
 
     // ====================================
-    // BUTTON INTERACTIONS
+    // BUTTONS
     // ====================================
 
     if (interaction.isButton()) {
+      // GIVEAWAY ENTRY
       if (interaction.customId.startsWith("prizen_enter:")) {
-        const giveawayId = interaction.customId.slice(
-          "prizen_enter:".length
-        );
-        const giveaway = giveaways.get(giveawayId);
+        const id = interaction.customId.slice("prizen_enter:".length);
+        const giveaway = data.giveaways[id];
 
-        if (!giveaway || giveaway.endAt <= Date.now()) {
-          return interaction.reply({
-            content: "This giveaway has ended.",
-            ephemeral: true
-          });
+        if (
+          !giveaway ||
+          giveaway.ended ||
+          giveaway.endAt <= Date.now()
+        ) {
+          return safeReply(interaction, "This giveaway has ended.");
         }
 
-        if (giveaway.entries.has(interaction.user.id)) {
-          return interaction.reply({
-            content: "You have already entered this giveaway.",
-            ephemeral: true
-          });
+        if (interaction.guildId !== giveaway.guildId) {
+          return safeReply(interaction, "This giveaway is not in this server.");
         }
 
-        giveaway.entries.add(interaction.user.id);
+        if (giveaway.entries?.[interaction.user.id]) {
+          return safeReply(interaction, "You have already entered this giveaway.");
+        }
 
-        await interaction.reply({
-          content: "🎉 You're entered! Good luck.",
-          ephemeral: true
-        });
+        giveaway.entries ||= {};
+        giveaway.entries[interaction.user.id] = Date.now();
+        await saveData();
+
+        await safeReply(interaction, "🎉 You're entered! Good luck.");
 
         try {
-          const message = interaction.message;
-          const oldEmbed = message.embeds[0];
-
-          if (oldEmbed) {
-            const updated = EmbedBuilder.from(oldEmbed)
-              .setDescription(
-                `**Prize:** ${giveaway.prize}\n` +
-                `**Hosted by:** <@${oldEmbed.description?.match(/Hosted by: <@!?(\d+)>/)?.[1] || client.user.id}>\n` +
-                `**Entries:** ${giveaway.entries.size}\n` +
-                `**Ends:** <t:${Math.floor(giveaway.endAt / 1000)}:R>`
-              );
-
-            await message.edit({ embeds: [updated] });
-          }
+          await interaction.message.edit({
+            embeds: [giveawayEmbed(giveaway)],
+            components: [giveawayRow(id)],
+            allowedMentions: { parse: [] }
+          });
         } catch (error) {
-          console.error("Could not update giveaway count:", error.message);
+          console.error("Could not update giveaway entries:", error.message);
         }
         return;
       }
 
+      // OPEN TICKET
       if (interaction.customId === "prizen_ticket_open") {
         const guild = interaction.guild;
 
         if (!guild) {
-          return interaction.reply({
-            content: "Use this button in the PRIZEN server.",
-            ephemeral: true
-          });
+          return safeReply(interaction, "Use this button in the PRIZEN server.");
         }
 
         const existing = guild.channels.cache.find(
@@ -624,123 +891,118 @@ client.on(Events.InteractionCreate, async interaction => {
         );
 
         if (existing) {
-          return interaction.reply({
-            content: `You already have a ticket: ${existing}`,
-            ephemeral: true
-          });
+          return safeReply(interaction, `You already have a ticket: ${existing}`);
         }
+
+        await interaction.deferReply({ ephemeral: true });
 
         const overwrites = [
           {
             id: guild.roles.everyone.id,
-            deny: ["ViewChannel"]
+            deny: [PermissionFlagsBits.ViewChannel]
           },
           {
             id: interaction.user.id,
-            allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"]
+            allow: [
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.ReadMessageHistory
+            ]
           },
           {
             id: client.user.id,
             allow: [
-              "ViewChannel",
-              "SendMessages",
-              "ReadMessageHistory",
-              "ManageChannels"
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.ReadMessageHistory,
+              PermissionFlagsBits.ManageChannels
             ]
           }
         ];
 
         if (STAFF_ROLE_ID) {
-          overwrites.push({
-            id: STAFF_ROLE_ID,
-            allow: [
-              "ViewChannel",
-              "SendMessages",
-              "ReadMessageHistory"
-            ]
-          });
+          const staffRole = await guild.roles.fetch(STAFF_ROLE_ID).catch(() => null);
+
+          if (staffRole) {
+            overwrites.push({
+              id: staffRole.id,
+              allow: [
+                PermissionFlagsBits.ViewChannel,
+                PermissionFlagsBits.SendMessages,
+                PermissionFlagsBits.ReadMessageHistory
+              ]
+            });
+          }
         }
 
-        const ticket = await guild.channels.create({
-          name: `ticket-${interaction.user.id}`,
-          type: ChannelType.GuildText,
-          permissionOverwrites: overwrites,
-          reason: `Support ticket opened by ${interaction.user.tag}`
-        });
+        try {
+          const ticket = await guild.channels.create({
+            name: `ticket-${interaction.user.id}`,
+            type: ChannelType.GuildText,
+            topic: `PRIZEN_OWNER:${interaction.user.id}`,
+            permissionOverwrites: overwrites,
+            reason: `Support ticket opened by ${interaction.user.tag}`
+          });
 
-        const closeRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("prizen_ticket_close")
-            .setLabel("Close Ticket")
-            .setStyle(ButtonStyle.Danger)
-        );
+          data.tickets[ticket.id] = {
+            ownerId: interaction.user.id,
+            guildId: guild.id,
+            channelId: ticket.id,
+            openedAt: Date.now()
+          };
+          await saveData();
 
-        await ticket.send({
-          content: `${interaction.user}${STAFF_ROLE_ID ? ` <@&${STAFF_ROLE_ID}>` : ""}`,
-          embeds: [
-            makeEmbed(
-              "PRIZEN Support Ticket",
-              "Describe the issue you need help with. A staff member will respond when available."
-            )
-          ],
-          components: [closeRow]
-        });
+          await ticket.send({
+            content: `${interaction.user}${STAFF_ROLE_ID ? ` <@&${STAFF_ROLE_ID}>` : ""}`,
+            embeds: [
+              makeEmbed(
+                "PRIZEN Support Ticket",
+                "Describe the issue you need help with. A staff member will respond when available."
+              )
+            ],
+            components: [ticketCloseRow()],
+            allowedMentions: {
+              users: [interaction.user.id],
+              roles: STAFF_ROLE_ID ? [STAFF_ROLE_ID] : []
+            }
+          });
 
-        await interaction.reply({
-          content: `Your private ticket is ready: ${ticket}`,
-          ephemeral: true
-        });
+          await interaction.editReply(`Your private ticket is ready: ${ticket}`);
 
-        await logToGuild(
-          guild,
-          `🎫 Ticket opened by ${interaction.user.tag}: ${ticket}`
-        );
+          await logToGuild(
+            guild,
+            `🎫 Ticket opened by ${interaction.user.tag}: ${ticket}`
+          );
+        } catch (error) {
+          console.error("Ticket creation failed:", error);
+          await interaction.editReply(
+            "I couldn't create the ticket. Check my Manage Channels permission and the configured staff role."
+          );
+        }
         return;
       }
 
+      // CLOSE TICKET BUTTON
       if (interaction.customId === "prizen_ticket_close") {
         const channel = interaction.channel;
 
-        if (!channel || !channel.name.startsWith("ticket-")) {
-          return interaction.reply({
-            content: "This button only works in a ticket channel.",
-            ephemeral: true
-          });
+        if (
+          !channel ||
+          channel.type !== ChannelType.GuildText ||
+          !channel.name.startsWith("ticket-")
+        ) {
+          return safeReply(interaction, "This button only works in a ticket channel.");
         }
 
-        const isTicketOwner =
-          channel.name === `ticket-${interaction.user.id}`;
-
-        if (!isTicketOwner && !isStaff(interaction)) {
-          return interaction.reply({
-            content: "Only the ticket owner or staff can close this ticket.",
-            ephemeral: true
-          });
-        }
-
-        await interaction.reply("Ticket closing in 3 seconds.");
-        await wait(3000);
-        await channel.delete("PRIZEN support ticket closed");
-        return;
+        return closeTicket(interaction, channel);
       }
     }
   } catch (error) {
     console.error("Interaction error:", error);
-
-    const reply = {
-      content: "Something went wrong. Check the bot console for details.",
-      ephemeral: true
-    };
-
-    try {
-      if (interaction.deferred) {
-        await interaction.editReply(reply);
-      } else if (interaction.replied) {
-        await interaction.followUp(reply);
-      } else {
-        await interaction.reply(reply);
-      }
-    } catch {}
+    await safeReply(
+      interaction,
+      "Something went wrong. Check the FadeHost console for the error details."
+    );
   }
 });
 
@@ -749,150 +1011,169 @@ client.on(Events.InteractionCreate, async interaction => {
 // ========================================
 
 client.on(Events.GuildMemberAdd, async member => {
-  const guild = member.guild;
-  const now = Date.now();
-
-  const joins = (joinTracker.get(guild.id) || [])
-    .filter(time => now - time < 20_000);
-
-  joins.push(now);
-  joinTracker.set(guild.id, joins);
-
-  const raidMode = raidModeGuilds.has(guild.id);
-
-  if (joins.length >= 8) {
-    await logToGuild(
-      guild,
-      `🚨 **Possible join raid:** ${joins.length} members joined in 20 seconds. Raid mode is ${raidMode ? "ON" : "OFF"}. Please review the joins.`
-    );
-  }
-
-  if (raidMode) {
-    await logToGuild(
-      guild,
-      `🛡️ Raid mode: new member joined — ${member.user.tag} (${member.id}).`
-    );
-  }
-
-  const welcome = guild.channels.cache.find(
-    c => c.name === "welcome" && c.type === ChannelType.GuildText
-  );
-
-  if (welcome) {
-    await welcome.send({
-      embeds: [
-        makeEmbed(
-          "Welcome to PRIZEN",
-          `Welcome ${member}!\n\nRead the server rules, meet the community, and check out our gaming and rewards channels.`,
-          COLORS.purple
-        )
-      ]
-    }).catch(error => {
-      console.error("Welcome message failed:", error.message);
-    });
-  }
-});
-
-// ========================================
-// BASIC ANTI-SPAM
-// ========================================
-
-client.on(Events.MessageCreate, async message => {
-  if (!message.guild || message.author.bot || !message.member) return;
-
-  const member = message.member;
-
-  if (
-    member.permissions.has(PermissionFlagsBits.Administrator) ||
-    member.permissions.has(PermissionFlagsBits.ManageMessages) ||
-    (STAFF_ROLE_ID && member.roles.cache.has(STAFF_ROLE_ID))
-  ) {
-    return;
-  }
-
-  const now = Date.now();
-  const key = `${message.guild.id}:${message.author.id}`;
-
-  const data = spamTracker.get(key) || {
-    recent: [],
-    lastContent: "",
-    duplicates: 0
-  };
-
-  data.recent = data.recent.filter(time => now - time < 7000);
-  data.recent.push(now);
-
-  if (message.content && message.content === data.lastContent) {
-    data.duplicates++;
-  } else {
-    data.duplicates = 0;
-  }
-
-  data.lastContent = message.content;
-  spamTracker.set(key, data);
-
-  const mentionCount = message.mentions.users.size;
-  const tooManyMessages = data.recent.length >= 6;
-  const duplicateSpam = data.duplicates >= 3;
-  const mentionSpam = mentionCount >= 6;
-
-  if (!tooManyMessages && !duplicateSpam && !mentionSpam) return;
-
   try {
-    await message.delete();
-  } catch {}
+    const guild = member.guild;
+    const now = Date.now();
 
-  let reason = "message flood";
-  if (duplicateSpam) reason = "repeated duplicate messages";
-  if (mentionSpam) reason = "excessive user mentions";
+    const joins = (joinTracker.get(guild.id) || [])
+      .filter(time => now - time < 20_000);
 
-  await logToGuild(
-    message.guild,
-    `🚫 **Anti-spam action:** ${message.author.tag} (${message.author.id})\nReason: ${reason}\nChannel: ${message.channel}`
-  );
+    joins.push(now);
+    joinTracker.set(guild.id, joins);
 
-  if (member.moderatable) {
-    try {
-      await member.timeout(60_000, `PRIZEN anti-spam: ${reason}`);
-    } catch (error) {
-      console.error("Timeout failed:", error.message);
+    const raidMode = isRaidMode(guild.id);
+
+    if (joins.length >= 8) {
+      await logToGuild(
+        guild,
+        `🚨 **Possible join raid:** ${joins.length} members joined in 20 seconds. ` +
+        `Raid mode is ${raidMode ? "ON" : "OFF"}. Please review the joins.`
+      );
     }
-  }
 
-  try {
-    await message.channel.send({
-      content: `${message.author}, slow down. Anti-spam protection detected repeated or excessive messages.`,
-      allowedMentions: { users: [message.author.id] }
-    });
-  } catch {}
+    if (raidMode) {
+      await logToGuild(
+        guild,
+        `🛡️ Raid mode: new member joined — ${member.user.tag} (${member.id}).`
+      );
+    }
+
+    const welcome = guild.channels.cache.find(
+      c => c.name === "welcome" && c.type === ChannelType.GuildText
+    );
+
+    if (welcome) {
+      await welcome.send({
+        embeds: [
+          makeEmbed(
+            "Welcome to PRIZEN",
+            `Welcome ${member}!\n\nRead the server rules, meet the community, and check out the gaming and rewards channels.`,
+            COLORS.purple
+          )
+        ],
+        allowedMentions: { users: [member.id] }
+      });
+    }
+  } catch (error) {
+    console.error("Welcome or join monitor failed:", error.message);
+  }
 });
 
 // ========================================
-// BASIC SCAM-LIKE MESSAGE FLAGGING
-// Logs suspicious-looking links; it does not
-// automatically ban people or claim certainty.
+// ANTI-SPAM
 // ========================================
 
 client.on(Events.MessageCreate, async message => {
-  if (!message.guild || message.author.bot) return;
+  try {
+    if (!message.guild || message.author.bot || !message.member) return;
 
-  const content = message.content.toLowerCase();
+    const member = message.member;
 
-  const suspiciousPatterns = [
-    /free nitro/,
-    /claim your nitro/,
-    /steam gift/,
-    /airdrop/,
-    /verify your account/,
-    /discord-nitro/
-  ];
+    if (
+      member.permissions.has(PermissionFlagsBits.Administrator) ||
+      member.permissions.has(PermissionFlagsBits.ManageMessages) ||
+      (STAFF_ROLE_ID && member.roles.cache.has(STAFF_ROLE_ID))
+    ) {
+      return;
+    }
 
-  if (!suspiciousPatterns.some(pattern => pattern.test(content))) return;
+    const now = Date.now();
+    const key = `${message.guild.id}:${message.author.id}`;
 
-  await logToGuild(
-    message.guild,
-    `🔎 **Review flagged message**\nAuthor: ${message.author.tag} (${message.author.id})\nChannel: ${message.channel}\nMessage: ${message.content.slice(0, 700)}`
-  );
+    const entry = spamTracker.get(key) || {
+      recent: [],
+      lastContent: "",
+      duplicates: 0,
+      lastActionAt: 0
+    };
+
+    entry.recent = entry.recent.filter(time => now - time < 7_000);
+    entry.recent.push(now);
+
+    if (message.content && message.content === entry.lastContent) {
+      entry.duplicates++;
+    } else {
+      entry.duplicates = 0;
+    }
+
+    entry.lastContent = message.content;
+    spamTracker.set(key, entry);
+
+    const tooManyMessages = entry.recent.length >= 6;
+    const duplicateSpam = entry.duplicates >= 3;
+    const mentionSpam = message.mentions.users.size >= 6;
+
+    if (!tooManyMessages && !duplicateSpam && !mentionSpam) return;
+
+    // Prevent repeated timeout attempts every time the member sends a message.
+    if (now - entry.lastActionAt < 60_000) return;
+    entry.lastActionAt = now;
+
+    try {
+      await message.delete();
+    } catch {}
+
+    let reason = "message flood";
+    if (duplicateSpam) reason = "repeated duplicate messages";
+    if (mentionSpam) reason = "excessive user mentions";
+
+    await logToGuild(
+      message.guild,
+      `🚫 **Anti-spam action:** ${message.author.tag} (${message.author.id})\n` +
+      `Reason: ${reason}\nChannel: ${message.channel}`
+    );
+
+    if (member.moderatable) {
+      try {
+        await member.timeout(60_000, `PRIZEN anti-spam: ${reason}`);
+      } catch (error) {
+        console.error("Anti-spam timeout failed:", error.message);
+      }
+    }
+
+    try {
+      await message.channel.send({
+        content: `${message.author}, slow down. Anti-spam protection detected repeated or excessive messages.`,
+        allowedMentions: { users: [message.author.id] }
+      });
+    } catch {}
+  } catch (error) {
+    console.error("Anti-spam handler failed:", error.message);
+  }
+});
+
+// ========================================
+// SUSPICIOUS MESSAGE FLAGGING
+// Flags messages for staff review; no auto-ban.
+// ========================================
+
+client.on(Events.MessageCreate, async message => {
+  try {
+    if (!message.guild || message.author.bot) return;
+
+    const content = message.content.toLowerCase();
+
+    const suspiciousPatterns = [
+      /free nitro/,
+      /claim your nitro/,
+      /steam gift/,
+      /airdrop/,
+      /verify your account/,
+      /discord-nitro/
+    ];
+
+    if (!suspiciousPatterns.some(pattern => pattern.test(content))) return;
+
+    await logToGuild(
+      message.guild,
+      `🔎 **Review flagged message**\n` +
+      `Author: ${message.author.tag} (${message.author.id})\n` +
+      `Channel: ${message.channel}\n` +
+      `Message: ${message.content.slice(0, 700)}`
+    );
+  } catch (error) {
+    console.error("Suspicious-message scan failed:", error.message);
+  }
 });
 
 // ========================================
@@ -900,6 +1181,7 @@ client.on(Events.MessageCreate, async message => {
 // ========================================
 
 client.login(TOKEN).catch(error => {
-  console.error("Bot login failed. Check BOT_TOKEN:", error.message);
+  console.error("Bot login failed. Check BOT_TOKEN and FadeHost environment variables.");
+  console.error(error.message);
   process.exit(1);
 });
